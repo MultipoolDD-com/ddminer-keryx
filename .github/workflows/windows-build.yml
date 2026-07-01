@@ -18,12 +18,14 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install CUDA Toolkit (Windows)
-        uses: Jimver/cuda-toolkit@v0.2.19
+        uses: Jimver/cuda-toolkit@v0.2.35
         id: cuda
         with:
-          cuda: '12.6.2'
+          cuda: '13.2.0'
+          # Full toolkit (no sub-packages): CUDA 13 split its packages, and a minimal set was missing
+          # crt/host_config.h. Full install guarantees all headers + import libs (also avoids later
+          # link errors for cublas.lib / curand.lib).
           method: 'network'
-          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "curand", "curand_dev", "thrust", "visual_studio_integration"]'
 
       - name: Install protoc
         uses: arduino/setup-protoc@v3
@@ -35,6 +37,14 @@ jobs:
           rustup default stable-x86_64-pc-windows-msvc
           rustc -vV
           cargo -vV
+
+      # Put the MSVC host compiler (cl.exe) on PATH for the whole job. bindgen_cuda calls nvcc
+      # directly, and nvcc needs cl.exe to compile the .cu host code — without this it fails with
+      # an empty stderr ("nvcc error while compiling affine.cu" and nothing else).
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64
 
       - name: Show CUDA
         shell: pwsh
@@ -48,6 +58,17 @@ jobs:
         env:
           CUDA_PATH: ${{ steps.cuda.outputs.CUDA_PATH }}
           CUDA_ROOT: ${{ steps.cuda.outputs.CUDA_PATH }}
+          # No GPU on the runner: bindgen_cuda (candle-kernels) would call nvidia-smi to detect the
+          # compute cap and panic. Pin it to the sm_80 floor (JITs up to any GPU >= sm_80 at runtime),
+          # matching the Linux build.
+          CUDA_COMPUTE_CAP: '80'
+          # nvcc honours NVCC_APPEND_FLAGS on every invocation.
+          #  -allow-unsupported-compiler: skip nvcc's host_config.h MSVC version gate.
+          #  -Xcompiler=/Zc:preprocessor: CUDA 13.2's CCCL headers (moe_wmma.cu) require MSVC's
+          #    standard-conforming preprocessor; the traditional one hard-errors.
+          #  /MD: use the DYNAMIC CRT for the nvcc-built libmoe, matching Rust MSVC's default. Without
+          #    it nvcc defaults to /MT (static) and the final link fails with LNK2038 (MT vs MD).
+          NVCC_APPEND_FLAGS: '-allow-unsupported-compiler -Xcompiler=/Zc:preprocessor,/MD'
         run: |
           cargo build --release --bin ddminer
           cargo build --release -p keryxcuda
