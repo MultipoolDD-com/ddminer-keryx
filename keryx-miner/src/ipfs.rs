@@ -79,6 +79,18 @@ pub fn is_running(api_url: &str) -> bool {
 
 /// Ensure the IPFS daemon is running. If not, download kubo and start it.
 /// Non-fatal: logs warnings on failure so the miner can still work (without inference rewards).
+/// User home directory, cross-platform: USERPROFILE on Windows, HOME elsewhere. Falls back to the
+/// current dir. kubo's default repo (`.ipfs`) and its config live under this.
+fn home_dir() -> std::path::PathBuf {
+    #[cfg(windows)]
+    let var = "USERPROFILE";
+    #[cfg(not(windows))]
+    let var = "HOME";
+    std::env::var_os(var)
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+}
+
 pub fn ensure_daemon(api_url: &str) {
     if is_running(api_url) {
         log::info!("IPFS daemon reachable at {}", api_url);
@@ -101,19 +113,27 @@ pub fn ensure_daemon(api_url: &str) {
         }
     };
 
-    // Init repo if first run.
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let ipfs_repo = std::path::PathBuf::from(&home).join(".ipfs");
-    if !ipfs_repo.exists() {
-        log::info!("Initialising IPFS repo...");
-        let _ = std::process::Command::new(&ipfs_bin).arg("init").status();
+    // Repo path. On Windows HOME is usually unset (USERPROFILE is the home dir), which made the old
+    // `$HOME/.ipfs` check resolve to `.\.ipfs` (never present) and re-run `ipfs init` every launch —
+    // kubo then errored "Reinitializing would overwrite your keys". Resolve home cross-platform and
+    // pin IPFS_PATH so our check and every kubo call agree on the same repo.
+    let ipfs_path = std::env::var_os("IPFS_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| home_dir().join(".ipfs"));
+    // Init only if the repo isn't there yet (check the actual config file, not just the dir).
+    if !ipfs_path.join("config").exists() {
+        log::info!("Initialising IPFS repo at {}...", ipfs_path.display());
+        let _ = std::process::Command::new(&ipfs_bin)
+            .arg("init")
+            .env("IPFS_PATH", &ipfs_path)
+            .status();
     }
 
     // Start daemon in background, redirecting output to a log file so
     // mDNS/discovery noise does not pollute the miner terminal while
     // keeping Kubo logs accessible for inference debugging.
     log::info!("Starting IPFS daemon...");
-    let log_dir = std::path::PathBuf::from(&home).join(".keryx");
+    let log_dir = home_dir().join(".keryx");
     let _ = std::fs::create_dir_all(&log_dir);
     let kubo_log = log_dir.join("kubo.log");
     let (stdout, stderr) = match std::fs::OpenOptions::new().create(true).append(true).open(&kubo_log) {
@@ -128,6 +148,7 @@ pub fn ensure_daemon(api_url: &str) {
     };
     match std::process::Command::new(&ipfs_bin)
         .args(["daemon", "--routing=dhtclient"])
+        .env("IPFS_PATH", &ipfs_path)
         .stdout(stdout)
         .stderr(stderr)
         .spawn()
