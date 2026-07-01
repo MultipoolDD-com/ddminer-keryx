@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
-[[ -e /hive/custom ]] && . /hive/custom/keryx-miner/h-manifest.conf
-[[ -e /hive/miners/custom ]] && . /hive/miners/custom/keryx-miner/h-manifest.conf
+# Source the manifest from this script's own dir (install-dir-name agnostic).
+. "$(cd "$(dirname "$(readlink -f "$0")")" && pwd)/h-manifest.conf"
 
 conf=""
 conf+=" -s $CUSTOM_URL --mining-address $CUSTOM_TEMPLATE"

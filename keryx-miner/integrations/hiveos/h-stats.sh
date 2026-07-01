@@ -3,7 +3,9 @@
 # Force C locale: on comma-decimal locales awk parses "30.30" as 30, corrupting the kH/s scaling.
 export LC_ALL=C
 
-. /hive/miners/custom/keryx-miner/h-manifest.conf
+# Source the manifest from THIS script's own dir, so it works regardless of the install dir name
+# HiveOS uses (keryx-miner vs keryx-miner-0.5.2, etc.).
+. "$(cd "$(dirname "$(readlink -f "$0")")" && pwd)/h-manifest.conf"
 
 LOG="$CUSTOM_LOG_BASENAME.log"
 
