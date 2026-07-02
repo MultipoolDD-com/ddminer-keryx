@@ -589,6 +589,16 @@ pub fn active_index(dev: u32) -> Option<Arc<WeightIndex>> {
     POM_INDICES.lock().ok()?.get(&dev).map(|(a, _)| a.clone())
 }
 
+/// Drop device `dev`'s index when it was built from a DIFFERENT model — after an OOM downgrade the
+/// device's assigned model changes, and keeping the stale index would trip the N-guard forever
+/// (`ensure_installed_inner` only rebuilds when no index is present). No-op when the model matches.
+pub fn invalidate_index_unless(dev: u32, model_id: &[u8; 32]) {
+    let mut g = POM_INDICES.lock().unwrap_or_else(|e| e.into_inner());
+    if g.get(&dev).map_or(false, |(_, m)| m != model_id) {
+        g.remove(&dev);
+    }
+}
+
 /// If another device already built an index for the same MODEL, share its Arc with `dev` instead of
 /// rebuilding — the WeightIndex is host-side and device-independent, so a uniform multi-GPU rig
 /// builds the (heavy, disk-backed) index once. Returns true if `dev` now has an index.

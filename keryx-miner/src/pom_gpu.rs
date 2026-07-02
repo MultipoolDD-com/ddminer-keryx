@@ -330,6 +330,57 @@ pub fn current_tier(dev: u32, daa: u64) -> Option<u8> {
     crate::models::pom_tier_index(&model_id, daa)
 }
 
+/// The CUDA device that mines `model_id` (from the per-GPU tier assignment), if any. Inference for a
+/// model is routed to the device that already holds it, so only that GPU pauses mining and the walk
+/// can share the resident weights (zero-dup). Returns the lowest matching `dev` when several GPUs
+/// mine the same tier; `None` when no GPU is assigned this model.
+pub fn device_for_model(model_id: &[u8; 32]) -> Option<u32> {
+    let g = MINING_TIERS.lock().ok()?;
+    g.iter().filter(|(_, (id, _))| id == model_id).map(|(dev, _)| *dev).min()
+}
+
+/// Models that OOM'd when loading on a given GPU: `(dev, model_id)`. Once banlisted, that GPU never
+/// retries that model (avoids a hot-spin reloading a model that doesn't fit); the OOM handler
+/// downgrades the GPU to a smaller downloaded tier instead.
+static OOM_BANLIST: Mutex<std::collections::BTreeSet<(u32, [u8; 32])>> =
+    Mutex::new(std::collections::BTreeSet::new());
+
+fn is_oom_banlisted(dev: u32, model_id: &[u8; 32]) -> bool {
+    OOM_BANLIST.lock().unwrap_or_else(|e| e.into_inner()).contains(&(dev, *model_id))
+}
+
+fn oom_banlist_add(dev: u32, model_id: [u8; 32]) {
+    OOM_BANLIST.lock().unwrap_or_else(|e| e.into_inner()).insert((dev, model_id));
+}
+
+/// After a GPU fails to load its assigned tier (OOM), reassign it to the largest **already-downloaded**
+/// PoM model strictly smaller than the failed one that hasn't itself been banlisted on this GPU — so a
+/// card whose VRAM estimate was optimistic (driver overhead + KV cache + fragmentation) mines a
+/// smaller tier instead of idling. Returns true if a downgrade was applied. No extra prefetch is
+/// needed: the candidate set is the served union (a mixed rig already downloaded the smaller tiers).
+fn downgrade_after_oom(dev: u32, failed_model: &[u8; 32], daa: u64) -> bool {
+    let Some(failed_tier) = crate::models::pom_tier_index(failed_model, daa) else {
+        return false;
+    };
+    let pick = crate::slm::served_pom_specs()
+        .into_iter()
+        .filter_map(|s| crate::models::pom_tier_index(&s.model_id, daa).map(|t| (t, s)))
+        .filter(|(t, s)| *t < failed_tier && !is_oom_banlisted(dev, &s.model_id))
+        .max_by_key(|(t, _)| *t);
+    match pick {
+        Some((tier, spec)) => {
+            let gguf = crate::slm::gguf_path_for(spec).to_string_lossy().into_owned();
+            info!("PoM[dev {}]: OOM on tier {} — downgrading to tier {} ({}).", dev, failed_tier, tier, spec.name);
+            set_mining_tier(dev, spec.model_id, gguf);
+            true
+        }
+        None => {
+            log::warn!("PoM[dev {}]: OOM and no smaller downloaded tier available — this GPU will not mine PoM (lower the tier flag or add VRAM).", dev);
+            false
+        }
+    }
+}
+
 /// The set of distinct mining model ids assigned across all devices (for capability declaration).
 pub fn assigned_model_ids() -> Vec<[u8; 32]> {
     let g = MINING_TIERS.lock().unwrap_or_else(|e| e.into_inner());
@@ -354,7 +405,7 @@ static INSTALL_LOCK: Mutex<()> = Mutex::new(());
 /// sm_80 floor, so loading dies with CUDA_ERROR_INVALID_PTX — a hardware limit; retrying is spam).
 static POM_UNSUPPORTED: Mutex<std::collections::BTreeSet<u32>> = Mutex::new(std::collections::BTreeSet::new());
 
-pub fn ensure_installed(dev: u32) -> bool {
+pub fn ensure_installed(dev: u32, daa: u64) -> bool {
     if is_installed(dev) {
         return true;
     }
@@ -372,17 +423,23 @@ pub fn ensure_installed(dev: u32) -> bool {
     }
     // Flag the heavy load so the stall watchdog stays benign while the worker is blocked here.
     LOADING.store(true, std::sync::atomic::Ordering::Relaxed);
-    let ok = ensure_installed_inner(dev);
+    let ok = ensure_installed_inner(dev, daa);
     LOADING.store(false, std::sync::atomic::Ordering::Relaxed);
     ok
 }
 
-fn ensure_installed_inner(dev: u32) -> bool {
+fn ensure_installed_inner(dev: u32, daa: u64) -> bool {
     // This device's assigned mining model (mixed rigs assign a different tier per GPU).
     let (model_id, gguf) = match mining_tier(dev) {
         Some(x) => x,
         None => return false,
     };
+    if is_oom_banlisted(dev, &model_id) {
+        return false; // this model OOM'd on this GPU before — don't retry (avoids a hot reload spin).
+    }
+    // An OOM downgrade may have reassigned this device's model — drop a stale (other-model) index
+    // so the build below runs for the CURRENT model instead of tripping the N-guard forever.
+    crate::pom::invalidate_index_unless(dev, &model_id);
     // Build THIS device's possession index once (host, heavy) the first time its PoM activates —
     // deferred from boot so the pre-PoM legacy phase starts immediately. The index is model-specific
     // so each device with a distinct model builds its own.
@@ -412,7 +469,7 @@ fn ensure_installed_inner(dev: u32) -> bool {
     // Device 0 shares the inference engine's resident weights (zero-dup) when they happen to be its
     // mining model, and is evicted whenever inference needs the GPU. Every other device loads its
     // OWN standalone copy of its mining model and mines PoM uninterrupted (no inference runs there).
-    let m = if dev == 0 {
+    if dev == 0 {
         // Make device 0's mining model resident again (evicts whatever inference loaded), then share
         // it. If inference currently holds a DIFFERENT model (e.g. a challenge for another GPU's
         // tier), pom_shared returns None and we fall back to a standalone load below.
@@ -424,29 +481,24 @@ fn ensure_installed_inner(dev: u32) -> bool {
             );
             return false;
         }
-        if let Some((device, shared)) = crate::slm::pom_shared(&model_id) {
-            PomGpuMiner::load_shared(&gguf, &device, &shared)
-        } else {
-            PomGpuMiner::load(&gguf, 0)
-        }
-    } else {
-        PomGpuMiner::load(&gguf, dev)
-    };
-    match m {
-        Ok(gm) => {
-            let n = gm.n_chunks();
-            // N-guard: the gather must match this device's host index, else blocks would be rejected.
-            if let Some(idx) = crate::pom::active_index(dev) {
-                if n != idx.n_chunks {
-                    log::error!("PoM: gather N={} != index N={} (dev {}) — refusing to mine (rejected blocks)", n, idx.n_chunks, dev);
-                    return false;
-                }
+    }
+    // Load the miner (zero-dup on the inference GPU, else a standalone copy). A load OOM surfaces as
+    // an Err or, in cudarc, a panic; catch both so the OOM handler can banlist + downgrade instead of
+    // crashing the mining thread or hot-spinning on a model that doesn't fit this GPU.
+    let loaded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if dev == 0 {
+            if let Some((device, shared)) = crate::slm::pom_shared(&model_id) {
+                PomGpuMiner::load_shared(&gguf, &device, &shared)
+            } else {
+                PomGpuMiner::load(&gguf, 0)
             }
-            install(dev, gm);
-            info!("PoM: GPU miner ready on device {} — N={} chunks resident (matches index)", dev, n);
-            true
+        } else {
+            PomGpuMiner::load(&gguf, dev)
         }
-        Err(e) => {
+    }));
+    let gm = match loaded {
+        Ok(Ok(gm)) => gm,
+        Ok(Err(e)) => {
             let msg = e.to_string();
             // INVALID_PTX / PTX JIT failure = the GPU's compute capability is below the PTX floor
             // (sm_80): Turing (RTX 20xx) / Volta / Pascal. That's hardware, not transient — disable
@@ -459,10 +511,34 @@ fn ensure_installed_inner(dev: u32) -> bool {
                      sm_80 (Ampere). RTX 20xx/Turing, V100/Volta and older CANNOT mine Keryx post-hardfork. \
                      Device #{dev} disabled for PoM; other GPUs keep mining. ({msg})"
                 );
+            } else if msg.contains("OUT_OF_MEMORY") || msg.contains("out of memory") || msg.contains("Oom") {
+                // The model doesn't fit this GPU (driver overhead + KV cache + fragmentation ate the
+                // estimate). Permanent for this (dev, model) — banlist and downgrade to a smaller tier.
+                log::error!("PoM[dev {}]: load OOM ({}) — banlisting this model and downgrading.", dev, msg);
+                oom_banlist_add(dev, model_id);
+                downgrade_after_oom(dev, &model_id, daa);
             } else {
+                // Transient (inference holds the GPU, file busy…): plain error, retry next block.
                 log::error!("PoM: rebuild failed (dev {}): {}", dev, msg);
             }
-            false
+            return false;
+        }
+        Err(_) => {
+            log::error!("PoM[dev {}]: device miner load panicked (likely OOM) — banlisting this model and downgrading.", dev);
+            oom_banlist_add(dev, model_id);
+            downgrade_after_oom(dev, &model_id, daa);
+            return false;
+        }
+    };
+    let n = gm.n_chunks();
+    // N-guard: the gather must match this device's host index, else blocks would be rejected.
+    if let Some(idx) = crate::pom::active_index(dev) {
+        if n != idx.n_chunks {
+            log::error!("PoM: gather N={} != index N={} (dev {}) — refusing to mine (rejected blocks)", n, idx.n_chunks, dev);
+            return false;
         }
     }
+    install(dev, gm);
+    info!("PoM: GPU miner ready on device {} — N={} chunks resident (matches index)", dev, n);
+    true
 }

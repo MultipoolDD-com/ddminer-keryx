@@ -292,17 +292,17 @@ impl MinerManager {
                     // over the resident weights instead of kHeavyHash. On a winning nonce we build
                     // the proof (host) and submit; the legacy plugin path below is skipped.
                     if matches!(state.as_ref(), Some(s) if s.daa_score >= keryx_miner::pom::POM_ACTIVATION_DAA) {
-                        let (pph, time, target_le) = {
+                        let (pph, time, target_le, block_daa) = {
                             let s = state.as_ref().unwrap();
                             let mut pph = [0u8; 32];
                             pph.copy_from_slice(&s.pow_hash_header[0..32]);
                             let time = u64::from_le_bytes(s.pow_hash_header[32..40].try_into().unwrap());
-                            (pph, time, s.target.to_le_bytes())
+                            (pph, time, s.target.to_le_bytes(), s.daa_score)
                         };
                         // An inference may have evicted the mining model (inference has priority).
                         // Rebuild the walk (reloads the model resident) before mining resumes.
                         if !keryx_miner::pom_gpu::is_installed(pom_dev) {
-                            keryx_miner::pom_gpu::ensure_installed(pom_dev);
+                            keryx_miner::pom_gpu::ensure_installed(pom_dev, block_daa);
                             // Still not resident (index/model still building, or an inference holds
                             // the GPU): mine() would no-op and return instantly. Counting a full
                             // POM_BATCH here would be a phantom — it inflates the reported hashrate
