@@ -605,22 +605,20 @@ async fn main() -> Result<(), Error> {
         } else {
             Vec::new()
         };
+    // Serve the uncensored lineup FROM THE START (as upstream v0.3.4 does): mainnet is permanently
+    // past OPOI_V2_ACTIVATION_DAA, so booting on the legacy lineup only creates a broken window on
+    // fresh installs — legacy files are never downloaded (lazy), so the initial declare is empty and
+    // every bridge challenge loops "model not ready — sending empty response" until a daa-carrying
+    // notify triggers the swap (which some bridges never send). Starting on v2 declares the real
+    // mining model immediately; set_v2_lineup keeps the crossing swap a consistent no-op (v2 → v2).
     keryx_miner::slm::set_v2_lineup(specs_v2);
-    keryx_miner::slm::init_supported(specs_v1);
+    keryx_miner::slm::init_supported(specs_v2);
+    let _ = specs_v1; // legacy lineup dropped post-fork (never downloaded, never served)
     info!(
-        "OPoI Phase-3 active — {} legacy + {} uncensored model(s) staged, DAA-gated at {}.",
-        specs_v1.len(),
+        "OPoI Phase-3 active — {} uncensored model(s) staged (legacy lineup dropped, post-fork).",
         specs_v2.len(),
-        keryx_miner::models::OPOI_V2_ACTIVATION_DAA
     );
     info!("Prefetching model files before mining starts…");
-    // The legacy (pre-hardfork) lineup is NOT eagerly downloaded: the OPoI v2 hardfork has already
-    // activated on mainnet, so the chain is permanently past OPOI_V2_ACTIVATION_DAA and the legacy
-    // models would never be mined/served — downloading them (e.g. DeepSeek-R1-32B, ~19.8 GB for the
-    // High tier) is pure waste. They stay staged and download lazily via ensure_loaded only if a
-    // pre-swap challenge actually requests one (which post-H it does not — the first notify swaps to
-    // the v2 lineup). On the (now-impossible on mainnet) pre-H path they download on first use.
-    let _ = specs_v1; // kept staged via init_supported above; intentionally not prefetched
     match tokio::task::spawn_blocking(move || keryx_miner::slm::prefetch_models(specs_v2)).await {
         Ok(Ok(())) => info!("Model files ready — starting mining."),
         Ok(Err(e)) => {
