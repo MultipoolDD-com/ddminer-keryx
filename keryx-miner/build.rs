@@ -32,9 +32,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-env-changed=SM_ARCH");
     if target_os != "macos" {
         let nvcc = env::var("NVCC").ok().unwrap_or_else(find_nvcc);
-        // sm_86 PTX runs on every Ampere+ GPU (30xx/40xx/50xx) via driver JIT.
-        // Override with SM_ARCH for older cards (e.g. 75 for Turing).
-        let sm = env::var("SM_ARCH").unwrap_or_else(|_| "86".to_string());
+        // sm_61 PTX runs on EVERY GPU from Pascal (GTX 10xx) up through Blackwell via driver JIT.
+        // The walk kernel is integer-only (no bf16/WMMA), so the low floor costs nothing — the JIT
+        // recompiles for the real target at load time. Override with SM_ARCH for a single-arch build.
+        let sm = env::var("SM_ARCH").unwrap_or_else(|_| "61".to_string());
         let out_dir = env::var("OUT_DIR").unwrap();
         let ptx = format!("{out_dir}/pom_mine.ptx");
         let status = std::process::Command::new(&nvcc)

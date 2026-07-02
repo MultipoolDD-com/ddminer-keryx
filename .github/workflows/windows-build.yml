@@ -59,9 +59,12 @@ jobs:
           CUDA_PATH: ${{ steps.cuda.outputs.CUDA_PATH }}
           CUDA_ROOT: ${{ steps.cuda.outputs.CUDA_PATH }}
           # No GPU on the runner: bindgen_cuda (candle-kernels) would call nvidia-smi to detect the
-          # compute cap and panic. Pin it to the sm_80 floor (JITs up to any GPU >= sm_80 at runtime),
-          # matching the Linux build.
-          CUDA_COMPUTE_CAP: '80'
+          # compute cap and panic. Pin the sm_75 floor (Turing / RTX 20xx and newer; the driver JIT
+          # compiles it up for newer GPUs at load time). CUDA 13.2 — required by the runner's MSVC —
+          # dropped Pascal (sm_61), so the Windows build's floor is Turing; the Linux bundles (built
+          # with CUDA 12.6) go down to sm_61/GTX 10xx. The MoE bf16 lib self-pins its sm_80 floor.
+          CUDA_COMPUTE_CAP: '75'
+          SM_ARCH: '75'
           # nvcc honours NVCC_APPEND_FLAGS on every invocation.
           #  -allow-unsupported-compiler: skip nvcc's host_config.h MSVC version gate.
           #  -Xcompiler=/Zc:preprocessor: CUDA 13.2's CCCL headers (moe_wmma.cu) require MSVC's

@@ -321,9 +321,16 @@ pub fn assigned_model_ids() -> Vec<[u8; 32]> {
 /// installs; the others block here and then find it ready via the re-checked `is_installed()`.
 static INSTALL_LOCK: Mutex<()> = Mutex::new(());
 
+/// Devices permanently disabled for PoM this run (e.g. Turing/sm_75: the PoM/inference PTX has an
+/// sm_80 floor, so loading dies with CUDA_ERROR_INVALID_PTX — a hardware limit; retrying is spam).
+static POM_UNSUPPORTED: Mutex<std::collections::BTreeSet<u32>> = Mutex::new(std::collections::BTreeSet::new());
+
 pub fn ensure_installed(dev: u32) -> bool {
     if is_installed(dev) {
         return true;
+    }
+    if POM_UNSUPPORTED.lock().unwrap_or_else(|e| e.into_inner()).contains(&dev) {
+        return false; // already diagnosed + logged once — stay quiet, let capable GPUs mine
     }
     // Recover from a poisoned lock (a prior worker panicked mid-build) rather than panicking the
     // whole miner — the worst case is one more rebuild attempt. The lock is global: it serializes
@@ -411,7 +418,21 @@ fn ensure_installed_inner(dev: u32) -> bool {
             true
         }
         Err(e) => {
-            log::error!("PoM: rebuild failed (dev {}): {}", dev, e);
+            let msg = e.to_string();
+            // INVALID_PTX / PTX JIT failure = the GPU's compute capability is below the PTX floor
+            // (sm_80): Turing (RTX 20xx) / Volta / Pascal. That's hardware, not transient — disable
+            // this device for PoM with ONE clear message instead of an endless retry-error loop, so
+            // capable GPUs in a mixed rig keep mining undisturbed.
+            if msg.contains("INVALID_PTX") || msg.contains("PTX JIT") || msg.contains("UNSUPPORTED_PTX") {
+                POM_UNSUPPORTED.lock().unwrap_or_else(|p| p.into_inner()).insert(dev);
+                log::error!(
+                    "PoM: GPU #{dev} does not support Proof-of-Model — its compute capability is below \
+                     sm_80 (Ampere). RTX 20xx/Turing, V100/Volta and older CANNOT mine Keryx post-hardfork. \
+                     Device #{dev} disabled for PoM; other GPUs keep mining. ({msg})"
+                );
+            } else {
+                log::error!("PoM: rebuild failed (dev {}): {}", dev, msg);
+            }
             false
         }
     }

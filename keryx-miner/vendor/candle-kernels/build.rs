@@ -8,23 +8,42 @@ fn main() {
     println!("cargo::rerun-if-changed=src/binary_op_macros.cuh");
 
     // Portable PTX virtual-arch floor. We ship ONE binary that must run on any
-    // miner GPU (RTX 30 = sm_86, RTX 40 = sm_89, RTX 50 = sm_120, A100 = sm_80…).
-    // bindgen_cuda::default() otherwise bakes the *build machine's* arch (e.g.
-    // sm_89 on a 4090), which fails with CUDA_ERROR_INVALID_PTX on lower GPUs
-    // because a PTX .target is a *minimum* capability. Compiling at sm_80 — the
-    // lowest arch the MoE bf16-WMMA kernels support — lets the NVIDIA driver
-    // JIT-compile the PTX up to whatever real GPU runs it at load time. Override
-    // with CUDA_COMPUTE_CAP=<n> for a single-arch optimised build.
+    // miner GPU (GTX 10xx = sm_61, RTX 20 = sm_75, RTX 30 = sm_86, RTX 40 = sm_89,
+    // RTX 50 = sm_120…). bindgen_cuda::default() otherwise bakes the *build
+    // machine's* arch, which fails with CUDA_ERROR_INVALID_PTX on lower GPUs
+    // because a PTX .target is a *minimum* capability. The standard kernel set is
+    // arch-guarded (bf16 paths gated by __CUDA_ARCH__ >= 800), so sm_61 compiles
+    // clean and the driver JIT-compiles it up to whatever real GPU loads it. The
+    // MoE bf16-WMMA static lib below keeps its own sm_80 floor — those kernels
+    // need it to COMPILE, and are only launched for MoE models (none in the PoM
+    // lineup), so they stay dead code on older GPUs. Override with
+    // CUDA_COMPUTE_CAP=<n> for a single-arch optimised build.
     println!("cargo::rerun-if-env-changed=CUDA_COMPUTE_CAP");
     let compute_cap: usize = env::var("CUDA_COMPUTE_CAP")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(80);
+        .unwrap_or(61);
+    let moe_compute_cap = compute_cap.max(80);
 
-    // Build for PTX
+    // Build for PTX — ONLY the standard kernel set. The moe/*.cu WMMA kernels need sm_80 to
+    // compile, so they must not enter this (sm_61-floor) PTX pass; they are built separately below
+    // as a static lib at their own sm_80 floor.
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let ptx_path = out_dir.join("ptx.rs");
     let builder = bindgen_cuda::Builder::default()
+        .kernel_paths(vec![
+            "src/affine.cu",
+            "src/binary.cu",
+            "src/cast.cu",
+            "src/conv.cu",
+            "src/fill.cu",
+            "src/indexing.cu",
+            "src/quantized.cu",
+            "src/reduce.cu",
+            "src/sort.cu",
+            "src/ternary.cu",
+            "src/unary.cu",
+        ])
         .compute_cap(compute_cap)
         .arg("--expt-relaxed-constexpr")
         .arg("-std=c++17")
@@ -36,7 +55,7 @@ fn main() {
     remove_lines(&ptx_path, &["MOE_GGUF", "MOE_WMMA", "MOE_WMMA_GGUF"]);
 
     let mut moe_builder = bindgen_cuda::Builder::default()
-        .compute_cap(compute_cap)
+        .compute_cap(moe_compute_cap)
         .arg("--expt-relaxed-constexpr")
         .arg("-std=c++17")
         .arg("-O3");
