@@ -75,7 +75,20 @@ impl Plugin for CudaPlugin {
             let gpus: Vec<u16> = match &opts.cuda_device {
                 Some(devices) => devices.clone(),
                 None => {
-                    let gpu_count = Device::num_devices().unwrap() as u16;
+                    // No panic si el driver CUDA no inicializa (driver roto/ausente, rig sin
+                    // NVIDIA): plugin deshabilitado con mensaje claro; el resto del miner sigue
+                    // (p. ej. RandomX CPU) en vez de abortar todo el proceso.
+                    let gpu_count = match Device::num_devices() {
+                        Ok(n) => n as u16,
+                        Err(e) => {
+                            log::error!(
+                                "CUDA driver init failed ({e:?}) — GPU mining disabled. \
+                                 Check the NVIDIA driver installation (nvidia-smi)."
+                            );
+                            self._enabled = false;
+                            return Ok(0);
+                        }
+                    };
                     (0..gpu_count).collect()
                 }
             };
