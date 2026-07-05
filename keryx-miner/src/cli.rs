@@ -18,7 +18,7 @@ pub struct Opt {
 
     #[clap(
         long = "light",
-        help = "Model tier: Gemma-3-4B only — any GPU (6GB+ VRAM)",
+        help = "Model tier: Gemma-3-4B — any GPU (6GB+ VRAM)",
         help_heading = "OPoI / Inference",
         conflicts_with_all = &["high", "very_high"]
     )]
@@ -34,7 +34,7 @@ pub struct Opt {
 
     #[clap(
         long = "very-high",
-        help = "Model tier: Llama-3.3-70B — 48GB+ single-GPU (RTX 6000 Ada / A6000 / L40S)",
+        help = "Model tier: Llama-3.3-70B — Q2_K_L 32GB (RTX 5090) / Q4 48GB (A6000 / L40S / RTX 6000 Ada)",
         help_heading = "OPoI / Inference",
         conflicts_with_all = &["light", "high", "default_tier"]
     )]
