@@ -623,7 +623,10 @@ async fn run() -> Result<(), Error> {
     // Stage BOTH lineups for this tier, each filtered by what this GPU can serve, so the
     // chain crossing OPOI_V2_ACTIVATION_DAA hot-swaps without a restart.
     let specs_v1 = union_lineup(0, &tiers);
-    let specs_v2 = union_lineup(keryx_miner::models::OPOI_V2_ACTIVATION_DAA, &tiers);
+    // Stage el lineup en el DAA de H2, NO en el de OPoI-v2: mainnet está permanentemente pasada
+    // H2 (38.95M), y specs_for evaluado pre-H2 hace que --very-light caiga al fallback Gemma
+    // (y --very-high al Q4 de 48GB) para siempre. Misma constante que usa upstream v0.3.5.
+    let specs_v2 = union_lineup(keryx_miner::models::VERY_LIGHT_ACTIVATION_DAA, &tiers);
     // PoM candidate models (those with a pinned R_T) staged in this lineup. Captured before
     // specs_v2 is consumed, so each GPU can be assigned the best-fitting one by VRAM below.
     let pom_candidates: Vec<&'static keryx_miner::models::ModelSpec> =
