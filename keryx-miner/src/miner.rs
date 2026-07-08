@@ -15,70 +15,10 @@ use keryx_miner::{PluginManager, WorkerSpec};
 
 type MinerHandler = std::thread::JoinHandle<Result<(), Error>>;
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-extern "C" fn signal_panic(_signal: nix::libc::c_int) {
-    panic!("Forced shutdown");
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn register_freeze_handler() {
-    let handler = nix::sys::signal::SigHandler::Handler(signal_panic);
-    unsafe {
-        nix::sys::signal::signal(nix::sys::signal::Signal::SIGUSR1, handler).unwrap();
-    }
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn trigger_freeze_handler(kill_switch: Arc<AtomicBool>, handle: &MinerHandler) -> std::thread::JoinHandle<()> {
-    use std::os::unix::thread::JoinHandleExt;
-    let pthread_handle = handle.as_pthread_t();
-    std::thread::spawn(move || {
-        sleep(Duration::from_millis(1000));
-        if kill_switch.load(Ordering::SeqCst) {
-            match nix::sys::pthread::pthread_kill(pthread_handle, nix::sys::signal::Signal::SIGUSR1) {
-                Ok(()) => {
-                    info!("Thread killed successfully")
-                }
-                Err(e) => {
-                    info!("Error: {:?}", e)
-                }
-            }
-        }
-    })
-}
-
-#[cfg(any(target_os = "windows"))]
-struct RawHandle(*mut std::ffi::c_void);
-
-#[cfg(any(target_os = "windows"))]
-unsafe impl Send for RawHandle {}
-
-#[cfg(any(target_os = "windows"))]
-fn register_freeze_handler() {}
-
-#[cfg(target_os = "windows")]
-fn trigger_freeze_handler(kill_switch: Arc<AtomicBool>, handle: &MinerHandler) -> std::thread::JoinHandle<()> {
-    use std::os::windows::io::AsRawHandle;
-    let raw_handle = RawHandle(handle.as_raw_handle());
-
-    std::thread::spawn(move || unsafe {
-        let ensure_full_move = raw_handle;
-        sleep(Duration::from_millis(1000));
-        if kill_switch.load(Ordering::SeqCst) {
-            kernel32::TerminateThread(ensure_full_move.0, 0);
-        }
-    })
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn trigger_freeze_handler(kill_switch: Arc<AtomicBool>, handle: &MinerHandler) {
-    warn!("Freeze handler is not implemented. Frozen threads are ignored");
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn register_freeze_handler() {
-    warn!("Freeze handler is not implemented. Frozen threads are ignored");
-}
+// NOTA: aquí vivía el "freeze handler" (SIGUSR1 -> panic! / TerminateThread) que mataba a los
+// workers que no cerraban en 1s. Eliminado: panicar desde un handler de señal sobre un frame de
+// libcuda aborta el proceso entero (panic_cannot_unwind), y TerminateThread deja locks del driver
+// colgados. El cierre ahora es espera acotada + detach (ver MinerManager::drop).
 
 #[derive(Clone)]
 enum WorkerCommand {
@@ -111,16 +51,31 @@ impl Drop for MinerManager {
         }
         while !self.handles.is_empty() {
             let handle = self.handles.pop().expect("There should be at least one");
-            let kill_switch = Arc::new(AtomicBool::new(true));
-            trigger_freeze_handler(kill_switch.clone(), &handle);
-            match handle.join() {
-                Ok(res) => match res {
-                    Ok(()) => {}
-                    Err(e) => error!("Error when closing Worker: {}", e),
-                },
-                Err(_) => error!("Worker failed to close gracefully"),
-            };
-            kill_switch.fetch_and(false, Ordering::SeqCst);
+            // Espera ACOTADA y sin señales. El mecanismo anterior (SIGUSR1 -> panic! en el
+            // handler tras 1s) abortaba el proceso entero: si la señal pilla al worker dentro
+            // de libcuda (p. ej. subiendo el buffer inicial), el frame C no puede hacer unwind
+            // -> panic_cannot_unwind -> abort. En GPUs con PCIe capado (CMP 170HX, x4 Gen1 y
+            // 8 tarjetas serializadas) ese build inicial tarda decenas de segundos y el hilo
+            // NO está colgado, solo lento. Si no termina en el plazo, se DETACHA: verá el
+            // Close en el canal al acabar su operación CUDA en curso y saldrá solo.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !handle.is_finished() && Instant::now() < deadline {
+                sleep(Duration::from_millis(100));
+            }
+            if handle.is_finished() {
+                match handle.join() {
+                    Ok(res) => match res {
+                        Ok(()) => {}
+                        Err(e) => error!("Error when closing Worker: {}", e),
+                    },
+                    Err(_) => error!("Worker failed to close gracefully"),
+                };
+            } else {
+                warn!(
+                    "Worker still busy after 30s (slow CUDA op in flight?) — detaching; \
+                     it exits on its own when the operation completes."
+                );
+            }
         }
     }
 }
@@ -135,7 +90,6 @@ const LOG_RATE: Duration = Duration::from_secs(10);
 
 impl MinerManager {
     pub fn new(send_channel: Sender<BlockSeed>, n_cpus: Option<u16>, manager: &PluginManager) -> Self {
-        register_freeze_handler();
         let hashes_tried = Arc::new(AtomicU64::new(0));
         let hashes_by_worker = Arc::new(Mutex::new(HashMap::<String, Arc<AtomicU64>>::new()));
         let opoi_challenge_active = Arc::new(AtomicBool::new(false));
