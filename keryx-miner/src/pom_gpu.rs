@@ -422,6 +422,31 @@ fn downgrade_after_oom(dev: u32, failed_model: &[u8; 32], daa: u64) -> bool {
     }
 }
 
+/// OOM al cargar `model_id` para INFERENCIA en `dev` (ruta SlmEngine, no PomGpuMiner). Si ese
+/// modelo es además el tier de minado del device, aplica el mismo tratamiento que un OOM del
+/// walk: banlist (dev, model) + downgrade al tier menor descargado — sin esto, el dev 0 de un
+/// rig justo reintentaba la carga del mismo modelo para siempre (ensure_loaded → false → retry).
+pub fn note_inference_oom(dev: u32, model_id: &[u8; 32]) {
+    // Tier ranking evaluado en el gate H2: mainnet está permanentemente pasada H2 y el caller
+    // (slm) no tiene el daa del bloque a mano; los índices de tier no cambian post-H2.
+    let daa = crate::models::VERY_LIGHT_ACTIVATION_DAA;
+    let is_mining_model = MINING_TIERS
+        .lock()
+        .map(|g| g.get(&dev).map_or(false, |(id, _)| id == model_id))
+        .unwrap_or(false);
+    if is_mining_model && !is_oom_banlisted(dev, model_id) {
+        log::error!(
+            "PoM[dev {}]: OOM cargando el modelo de minado para inferencia — banlist + downgrade.",
+            dev
+        );
+        oom_banlist_add(dev, *model_id);
+        downgrade_after_oom(dev, model_id, daa);
+        // El índice/miner del modelo viejo quedan invalidados en el próximo ensure_installed
+        // (invalidate_index_unless) — aquí solo liberamos el walk residente si lo hubiera.
+        uninstall(dev);
+    }
+}
+
 /// The set of distinct mining model ids assigned across all devices (for capability declaration).
 pub fn assigned_model_ids() -> Vec<[u8; 32]> {
     let g = MINING_TIERS.lock().unwrap_or_else(|e| e.into_inner());

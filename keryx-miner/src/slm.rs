@@ -1057,6 +1057,9 @@ pub fn load_and_run_inference(model_id: &[u8; 32], prompt: &str, max_tokens: usi
                 Ok(e) => { *guard = Some(e); }
                 Err(e) => {
                     log::error!("SlmEngine: failed to load '{}': {}", spec.name, e);
+                    if format!("{e:#}").contains("OUT_OF_MEMORY") || format!("{e:#}").contains("out of memory") {
+                        crate::pom_gpu::note_inference_oom(dev_id, model_id);
+                    }
                     return None;
                 }
             }
@@ -1140,6 +1143,9 @@ pub fn ensure_loaded(model_id: &[u8; 32]) -> bool {
         }
         Err(e) => {
             log::error!("SlmEngine: ensure_loaded '{}' failed: {}", spec.name, e);
+            if format!("{e:#}").contains("OUT_OF_MEMORY") || format!("{e:#}").contains("out of memory") {
+                crate::pom_gpu::note_inference_oom(dev_id, model_id);
+            }
             false
         }
     }

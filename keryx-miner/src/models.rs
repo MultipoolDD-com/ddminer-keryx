@@ -309,20 +309,45 @@ pub enum Tier {
     VeryHigh,
 }
 
+/// Suelo de VRAM (MB) para ASIGNAR un tier a una GPU en modo AUTO — el mínimo práctico para
+/// cargar el modelo del tier (pesos Q4 + KV + workspace CUDA + estado de minado PoM). Distinto
+/// de `ModelSpec.min_vram_mb`, que es 0 en los tiers pequeños (para no filtrarlos nunca del
+/// ai:cap) y por eso no sirve para rankear tier 0 vs 1 por VRAM (mismo enfoque que el
+/// POM_TIER_LADDER de upstream).
+pub fn tier_floor_mb(t: Tier) -> u64 {
+    match t {
+        Tier::VeryLight => 2_000,
+        Tier::Light => 5_000,
+        Tier::Default => 8_000,
+        Tier::High => 24_000,
+        Tier::VeryHigh => 30_000,
+    }
+}
+
 /// The highest PoM hardware tier whose model fits a single GPU with `vram_mb` of VRAM.
+/// Optimista a propósito (una GPU justa puede fallar al cargar por fragmentación/overhead):
+/// el runtime corrige con el banlist de OOM + downgrade automático al tier menor descargado.
 pub fn tier_for_vram(vram_mb: u64) -> Tier {
-    // Gate VeryHigh on the Q2_K_L footprint (30 GB) — the post-H2 top model that's actually
-    // servable; the pre-H2 Q4 (46 GB) is effectively unreachable on consumer cards anyway.
-    if vram_mb >= LLAMA_3_3_70B_Q2.min_vram_mb {
-        Tier::VeryHigh
-    } else if vram_mb >= QWEN3_32B.min_vram_mb {
-        Tier::High
-    } else if vram_mb >= DOLPHIN_LLAMA3_8B.min_vram_mb {
-        Tier::Default
-    } else {
-        // Floor = Light (Gemma-3-4B, the better small model; min_vram 0 = any GPU). The very-light
-        // Qwen3-1.7B tier is opt-in via --very-light, not auto-selected.
-        Tier::Light
+    [Tier::VeryHigh, Tier::High, Tier::Default, Tier::Light]
+        .into_iter()
+        .find(|t| vram_mb >= tier_floor_mb(*t))
+        // GPUs pequeñas (< 5 GB) van al tier 0 (Qwen3-1.7B) en vez de forzar Gemma y fallar.
+        .unwrap_or(Tier::VeryLight)
+}
+
+#[cfg(test)]
+mod tier_tests {
+    use super::*;
+
+    #[test]
+    fn auto_tier_por_vram() {
+        assert_eq!(tier_for_vram(4_096), Tier::VeryLight); // GTX 1650 / tarjetas 4GB
+        assert_eq!(tier_for_vram(6_144), Tier::Light); // 1660 / 3050 6GB
+        assert_eq!(tier_for_vram(7_892), Tier::Light); // CMP 170HX (8GB reales)
+        assert_eq!(tier_for_vram(11_264), Tier::Default); // 1080 Ti / 2080 Ti
+        assert_eq!(tier_for_vram(12_288), Tier::Default); // 3060 12GB
+        assert_eq!(tier_for_vram(24_564), Tier::High); // 3090 / 4090
+        assert_eq!(tier_for_vram(32_607), Tier::VeryHigh); // 5090
     }
 }
 

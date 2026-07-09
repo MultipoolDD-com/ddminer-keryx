@@ -152,9 +152,25 @@ fn parse_cpu_spec(
     Ok((coin, wallet, Some(host), port))
 }
 
-/// Per-GPU total VRAM in MB, indexed by CUDA device ordinal (one nvidia-smi line per GPU).
+/// Per-GPU total VRAM in MB, indexed by CUDA device ordinal.
 /// Empty on failure → callers fall back to assigning every GPU the same (highest staged) tier.
+///
+/// FUENTE: el driver CUDA (query_all_gpus_vram), NO nvidia-smi. nvidia-smi lista en orden PCI
+/// y CUDA enumera FASTEST_FIRST por defecto: en un rig mixto lanzado sin CUDA_DEVICE_ORDER,
+/// la línea N de nvidia-smi puede ser OTRA tarjeta que el device CUDA N — y la asignación
+/// per-GPU acababa dando a la tarjeta pequeña el modelo de la grande (OOM) y viceversa.
 fn per_gpu_vram_mb() -> Vec<u64> {
+    let by_cuda = keryx_miner::pom_gpu::query_all_gpus_vram();
+    if !by_cuda.is_empty() {
+        // query_all_gpus_vram devuelve (device_id, MB) en orden CUDA; densifica por índice.
+        let n = by_cuda.iter().map(|(id, _)| *id).max().unwrap_or(0) + 1;
+        let mut v = vec![0u64; n];
+        for (id, mb) in by_cuda {
+            v[id] = mb;
+        }
+        return v;
+    }
+    // Fallback (sin driver CUDA cargable): nvidia-smi, mejor que nada.
     match std::process::Command::new("nvidia-smi")
         .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
         .output()
@@ -232,25 +248,23 @@ fn check_gpu_power_limit(needs_high: bool, needs_very_high: bool) {
     }
 }
 
-/// Total VRAM (MB) of the CUDA device the miner mines/serves on (CUDA device 0), or None when no
-/// CUDA device is present (CPU-only / AMD hosts). Sourced from the CUDA driver so it matches the
-/// `device_id` candle/PoM actually load onto — unlike nvidia-smi, whose PCI ordering can disagree
-/// with CUDA's `FASTEST_FIRST` default on a mixed rig and report a different card's VRAM.
-fn query_vram_mb() -> Option<u64> {
-    keryx_miner::pom_gpu::query_all_gpus_vram()
-        .into_iter()
-        .find(|(id, _)| *id == 0)
-        .map(|(_, mb)| mb)
+/// Total VRAM (MB) of the LARGEST CUDA device on the rig, or None when no CUDA device is
+/// present (CPU-only / AMD hosts). Sourced from the CUDA driver so it matches the `device_id`
+/// candle/PoM actually load onto.
+fn query_max_vram_mb() -> Option<u64> {
+    keryx_miner::pom_gpu::query_all_gpus_vram().into_iter().map(|(_, mb)| mb).max()
 }
 
-/// OPoI capability gate (layer A): drop the models this machine cannot actually
-/// serve on CUDA device 0, so the `ai:cap` announcement never promises a model the miner
-/// would fail to load. Skipped when no CUDA device is present (CPU-fallback setups
-/// keep working).
+/// OPoI capability gate (layer A): drop the models NO GPU on this rig can serve, so the
+/// `ai:cap` announcement never promises a model the miner would fail to load. Gate contra la
+/// GPU MAYOR, no contra device 0: post-0.5.5 la inferencia se enruta a la GPU que mina ese
+/// modelo (device_for_model), así que basta con que ALGUNA tarjeta pueda servirlo. Con el
+/// gate de device 0, un rig mixto con la tarjeta pequeña en el slot 0 filtraba del lineup el
+/// modelo de la grande — que se quedaba sin tier útil. Skipped when no CUDA device is present.
 fn filter_specs_by_vram(
     specs: &'static [&'static keryx_miner::models::ModelSpec],
 ) -> &'static [&'static keryx_miner::models::ModelSpec] {
-    let Some(gpu0_mb) = query_vram_mb() else {
+    let Some(max_mb) = query_max_vram_mb() else {
         log::warn!("Cannot query GPU VRAM (CUDA driver) — skipping the model capability gate.");
         return specs;
     };
@@ -258,14 +272,14 @@ fn filter_specs_by_vram(
         .iter()
         .copied()
         .filter(|spec| {
-            if spec.min_vram_mb <= gpu0_mb {
+            if spec.min_vram_mb <= max_mb {
                 true
             } else {
                 log::warn!(
-                    "✗  '{}' needs ≥{} MB VRAM but only {} MB on CUDA device 0 — model NOT announced (ai:cap) and not downloaded.",
+                    "✗  '{}' needs ≥{} MB VRAM but the largest GPU has {} MB — model NOT announced (ai:cap) and not downloaded.",
                     spec.name,
                     spec.min_vram_mb,
-                    gpu0_mb,
+                    max_mb,
                 );
                 false
             }
@@ -606,6 +620,12 @@ async fn run() -> Result<(), Error> {
                 warn!("No per-GPU VRAM info — defaulting to the Dolphin-8B tier.");
                 ts.push(Tier::Default);
             }
+            // Red de seguridad para el downgrade por OOM: stagear SIEMPRE el tier 0 (Qwen3-1.7B,
+            // ~1.1 GB de descarga). Si a una GPU justa no le cabe su tier asignado en runtime
+            // (fragmentación, overhead del walk), downgrade_after_oom solo puede elegir entre
+            // modelos YA descargados — sin esto, una GPU de 8 GB que falla con Gemma se quedaba
+            // sin candidato menor y dejaba de minar PoM.
+            ts.push(Tier::VeryLight);
             ts.sort();
             ts.dedup();
             ts
@@ -672,19 +692,35 @@ async fn run() -> Result<(), Error> {
     // run, so each device picks the best it can fit.
     if !pom_candidates.is_empty() {
         keryx_miner::slm::set_pom_force_split(true);
+        // Rango del candidato = su tier post-H2 (pom_tier_index a partir del gate H2, ya que
+        // mainnet está permanentemente pasada H2) y suelo = tier_floor_mb del tier. NO usar
+        // min_vram_mb para rankear: es 0 tanto en Qwen3-1.7B como en Gemma y el max_by_key
+        // era un empate arbitrario.
+        let tier_of = |s: &'static keryx_miner::models::ModelSpec| -> (u8, u64) {
+            use keryx_miner::models::{pom_tier_index, tier_floor_mb, Tier, VERY_LIGHT_ACTIVATION_DAA};
+            let idx = pom_tier_index(&s.model_id, VERY_LIGHT_ACTIVATION_DAA).unwrap_or(0);
+            let floor = tier_floor_mb(match idx {
+                0 => Tier::VeryLight,
+                1 => Tier::Light,
+                2 => Tier::Default,
+                3 => Tier::High,
+                _ => Tier::VeryHigh,
+            });
+            (idx, floor)
+        };
         let pick = |vram_mb: u64| -> &'static keryx_miner::models::ModelSpec {
             pom_candidates
                 .iter()
                 .copied()
-                .filter(|s| s.min_vram_mb <= vram_mb)
-                .max_by_key(|s| s.min_vram_mb)
-                .or_else(|| pom_candidates.iter().copied().min_by_key(|s| s.min_vram_mb))
+                .filter(|s| tier_of(s).1 <= vram_mb)
+                .max_by_key(|s| tier_of(s).0)
+                .or_else(|| pom_candidates.iter().copied().min_by_key(|s| tier_of(s).0))
                 .expect("pom_candidates is non-empty")
         };
         let vram = per_gpu_vram_mb();
         if vram.is_empty() {
             // No per-GPU VRAM info: assign device 0 the highest staged tier; other GPUs fall back to it.
-            let spec = pom_candidates.iter().copied().max_by_key(|s| s.min_vram_mb).unwrap();
+            let spec = pom_candidates.iter().copied().max_by_key(|s| tier_of(s).0).unwrap();
             keryx_miner::pom_gpu::set_mining_tier(
                 0,
                 spec.model_id,
