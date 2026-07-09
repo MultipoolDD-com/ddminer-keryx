@@ -1693,7 +1693,7 @@ dependencies = [
 
 [[package]]
 name = "keryx-miner"
-version = "0.5.7"
+version = "0.5.8"
 dependencies = [
  "anyhow",
  "async-trait",

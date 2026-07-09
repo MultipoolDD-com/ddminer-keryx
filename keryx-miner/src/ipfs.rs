@@ -129,6 +129,25 @@ pub fn ensure_daemon(api_url: &str) {
             .status();
     }
 
+    // Config farm-friendly, aplicada en CADA arranque (idempotente, daemon aún parado):
+    // - Sin mDNS: en una granja, N daemons kubo en la misma LAN se descubren todos entre sí
+    //   y forman una malla n² de conexiones + gossip — con cientos de rigs es una tormenta
+    //   de broadcast que lagea la red entera. El contenido llega igual por el DHT (WAN).
+    // - ConnMgr bajo: el miner solo usa IPFS para descargas puntuales de modelos y subir
+    //   respuestas OPoI; los defaults de kubo (cientos de peers) sobran.
+    for args in [
+        ["config", "--json", "Discovery.MDNS.Enabled", "false"],
+        ["config", "--json", "Swarm.ConnMgr.LowWater", "32"],
+        ["config", "--json", "Swarm.ConnMgr.HighWater", "96"],
+    ] {
+        let _ = std::process::Command::new(&ipfs_bin)
+            .args(args)
+            .env("IPFS_PATH", &ipfs_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+
     // Start daemon in background, redirecting output to a log file so
     // mDNS/discovery noise does not pollute the miner terminal while
     // keeping Kubo logs accessible for inference debugging.

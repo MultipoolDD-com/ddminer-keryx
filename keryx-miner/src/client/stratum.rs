@@ -790,15 +790,23 @@ impl StratumHandler {
             return;
         }
 
-        // Pause PoW so the GPU is fully available for the challenge inference.
-        // In --cpu-inference mode the GPU is free, so keep hashing during the challenge.
+        // Pausa SOLO la GPU que sirve este modelo (device_for_model) — antes se suspendía el
+        // PoW del rig ENTERO (process_block(None) → job nulo a todos los workers) por una
+        // inferencia que ocupa una única GPU; en rigs multi-GPU con challenges frecuentes eso
+        // hundía el hashrate. El worker de la GPU objetivo entra en backoff solo (su walk se
+        // evicta al cargar la inferencia y ensure_installed devuelve false mientras
+        // inference_busy); las demás GPUs no se enteran.
         let miner_flag = miner.opoi_challenge_flag();
+        let challenge_dev = keryx_miner::pom_gpu::device_for_model(&model_id).unwrap_or(0);
         if keryx_miner::slm::cpu_inference_enabled() {
             info!("OPoI challenge: CPU inference — PoW continues — model={:.8} nonce={:.8}", model_id_hex, nonce_hex);
         } else {
-            miner_flag.store(true, Ordering::SeqCst);
-            miner.process_block(None).await.ok();
-            info!("OPoI challenge: PoW suspended — model={:.8} nonce={:.8}", model_id_hex, nonce_hex);
+            keryx_miner::pom_gpu::set_inference_busy(challenge_dev, true);
+            miner_flag.store(true, Ordering::SeqCst); // solo para la línea de estado
+            info!(
+                "OPoI challenge: GPU {} paused for inference (other GPUs keep mining) — model={:.8} nonce={:.8}",
+                challenge_dev, model_id_hex, nonce_hex
+            );
         }
 
         let prompt = format!("Keryx inference challenge {}: briefly describe what you are.", nonce_hex);
@@ -808,7 +816,9 @@ impl StratumHandler {
         tokio::task::spawn_blocking(move || {
             let result = keryx_miner::slm::load_and_run_inference(&model_id, &prompt, CHALLENGE_MAX_TOKENS);
             let text = result.unwrap_or_default();
-            // Clear both flags — PoW resumes on the next mining.notify from the bridge.
+            // Libera la GPU del challenge (su worker reinstala el walk en su siguiente vuelta)
+            // y limpia los flags de estado.
+            keryx_miner::pom_gpu::set_inference_busy(challenge_dev, false);
             miner_flag.store(false, Ordering::SeqCst);
             challenge_flag.store(false, Ordering::SeqCst);
             if text.is_empty() {
@@ -874,14 +884,15 @@ impl StratumHandler {
             return false;
         }
 
-        // Pause PoW — running kHeavyHash and SLM inference simultaneously crashes the GPU.
-        // In --cpu-inference mode the GPU is free, so keep hashing during inference.
+        // Pausa SOLO la GPU que sirve este modelo — misma lógica selectiva que el challenge
+        // handler (antes: process_block(None) suspendía el rig entero por una inferencia).
         let cpu_inference = keryx_miner::slm::cpu_inference_enabled();
         let miner_flag = miner.opoi_challenge_flag();
+        let task_dev = keryx_miner::pom_gpu::device_for_model(&model_id).unwrap_or(0);
         if !cpu_inference {
-            miner_flag.store(true, Ordering::SeqCst);
-            miner.process_block(None).await.ok();
-            info!("OPoI AiTask [{}]: PoW suspended for GPU inference", task.stable_id);
+            keryx_miner::pom_gpu::set_inference_busy(task_dev, true);
+            miner_flag.store(true, Ordering::SeqCst); // solo para la línea de estado
+            info!("OPoI AiTask [{}]: GPU {} paused for inference (other GPUs keep mining)", task.stable_id, task_dev);
         } else {
             info!("OPoI AiTask [{}]: CPU inference — PoW continues", task.stable_id);
         }
@@ -900,7 +911,8 @@ impl StratumHandler {
 
         tokio::task::spawn_blocking(move || {
             run_inference_and_upload(model_id, prompt, max_tokens, ipfs_url, stable_id, cache_ref);
-            // Clear both flags — PoW resumes on the next mining.notify from the bridge.
+            // Libera la GPU de la task (su worker reinstala el walk solo) y limpia flags.
+            keryx_miner::pom_gpu::set_inference_busy(task_dev, false);
             miner_flag.store(false, Ordering::SeqCst);
             challenge_flag.store(false, Ordering::SeqCst);
         });

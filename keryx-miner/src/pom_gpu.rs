@@ -426,6 +426,26 @@ fn downgrade_after_oom(dev: u32, failed_model: &[u8; 32], daa: u64) -> bool {
 /// modelo es además el tier de minado del device, aplica el mismo tratamiento que un OOM del
 /// walk: banlist (dev, model) + downgrade al tier menor descargado — sin esto, el dev 0 de un
 /// rig justo reintentaba la carga del mismo modelo para siempre (ensure_loaded → false → retry).
+/// Devices con una inferencia OPoI en vuelo: su walk fue evictado y NO debe reinstalarse hasta
+/// que la inferencia acabe (reinstalar en paralelo = contención/OOM de VRAM). Los demás devices
+/// siguen minando — la pausa por challenge dejó de ser global en 0.5.8.
+static INFERENCE_BUSY: Mutex<std::collections::BTreeSet<u32>> =
+    Mutex::new(std::collections::BTreeSet::new());
+
+/// Marca/desmarca `dev` como ocupado por una inferencia OPoI.
+pub fn set_inference_busy(dev: u32, busy: bool) {
+    let mut g = INFERENCE_BUSY.lock().unwrap_or_else(|e| e.into_inner());
+    if busy {
+        g.insert(dev);
+    } else {
+        g.remove(&dev);
+    }
+}
+
+fn inference_busy(dev: u32) -> bool {
+    INFERENCE_BUSY.lock().unwrap_or_else(|e| e.into_inner()).contains(&dev)
+}
+
 pub fn note_inference_oom(dev: u32, model_id: &[u8; 32]) {
     // Tier ranking evaluado en el gate H2: mainnet está permanentemente pasada H2 y el caller
     // (slm) no tiene el daa del bloque a mano; los índices de tier no cambian post-H2.
@@ -477,6 +497,11 @@ pub fn ensure_installed(dev: u32, daa: u64) -> bool {
     }
     if POM_UNSUPPORTED.lock().unwrap_or_else(|e| e.into_inner()).contains(&dev) {
         return false; // already diagnosed + logged once — stay quiet, let capable GPUs mine
+    }
+    if inference_busy(dev) {
+        // Una inferencia OPoI tiene esta GPU: no reinstales el walk hasta que acabe (el worker
+        // hace backoff sin contar hashes). Las demás GPUs no pasan por aquí y siguen minando.
+        return false;
     }
     // Recover from a poisoned lock (a prior worker panicked mid-build) rather than panicking the
     // whole miner — the worst case is one more rebuild attempt. The lock is global: it serializes
